@@ -1,0 +1,302 @@
+---
+title: "Assignment 1: NYT API"
+author: "Lewis"
+date: "2023-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(jsonlite) #convert results from API queries into R-friendly formats 
+library(tidyverse)
+library(tidytext) #text data management and analysis
+library(ggplot2) #plot word frequencies and publication dates
+
+
+#source in API key.  When you create a NYT Dev account, you will be given a key
+source("/Users/lewiswhite/MEDS/text_sentiment_analysis/text_analysis/nyt_api_key.R")
+```
+
+## Assignment (Due Tuesday 4/11 11:59pm)
+
+1.  Create a free New York Times account (<https://developer.nytimes.com/get-started>)
+
+2.  Pick an interesting environmental key word(s) and use the {jsonlite} package to query the API. Pick something high profile enough and over a large enough time frame that your query yields enough articles for an interesting examination.
+
+3.  Recreate the publications per day and word frequency plots using the first paragraph.  This time filter on the response.docs.news_desk variable to winnow out irrelevant results.
+
+-   Make some (at least 3) transformations to the corpus (add context-specific stopword(s), stem a key term and its variants, remove numbers)
+
+4.  Recreate the publications per day and word frequency plots using the headlines variable (response.docs.headline.main). Compare the distributions of word frequencies between the first paragraph and headlines. Do you see any difference?
+
+
+### For this exercise, I chose articles about climate and disease.
+
+Set up the base search url
+```{r}
+term1 <- "climate" # Need to use $ to string together separate terms
+term2 <- "$disease"
+
+begin_date <- "20220120"
+end_date <- "20230401"
+
+#construct the query url using API operators
+baseurl <- paste0("http://api.nytimes.com/svc/search/v2/articlesearch.json?q=",term1, term2, "&begin_date=",begin_date,"&end_date=",end_date,"&facet_filter=true&api-key=", API_KEY, sep="")
+
+#examine our query url
+#baseurl
+```
+
+obtain a data frame with information about all articles that match the climate + disease search term
+```{r, eval=FALSE}
+#dig into the JSON object to find total hits
+initialQuery <- fromJSON(baseurl)
+maxPages <- round((initialQuery$response$meta$hits[1] / 10)-1) 
+
+#display number of pages
+maxPages
+
+#initiate a list to hold results of our for loop
+pages <- list()
+
+#loop through search to obtain list of dataframes with articles
+for(i in 0:maxPages){
+  nytSearch <- fromJSON(paste0(baseurl, "&page=", i), flatten = TRUE) %>% data.frame() 
+  message("Retrieving page ", i)
+  pages[[i+1]] <- nytSearch 
+  Sys.sleep(15) 
+}
+```
+We converted each returned JSON object into a data frame
+
+In order to combine these dataframe, the columns need to be the same.
+```{r bind_rows}
+# # Get the common column names across all data frames in the list
+# common_cols <- Reduce(intersect, lapply(pages, colnames))
+# 
+# # Loop through each data frame in the list
+# for (i in seq_along(pages)) {
+#   # Select only the common columns
+#   pages[[i]] <- pages[[i]] %>%
+#     select(all_of(common_cols))
+# }
+# 
+# #need to bind the pages and create a tibble from nytDat
+# df <- do.call(what = "rbind", args = pages)
+# 
+# #save the data so we don't need to run the above loop each time
+# saveRDS(df, "nyt_df.rds")
+```
+
+Now that we have (somewhat) clean data, we can begin visualizing it. 
+```{r article-type, warning = FALSE}
+df <- read_rds("nyt_df.rds")
+
+df %>% 
+  group_by(response.docs.news_desk) %>%
+  summarize(count=n()) %>%
+  mutate(percent = (count / sum(count))*100) %>%
+  ggplot() +
+  geom_bar(aes(y=percent, x=reorder(response.docs.news_desk, percent), fill=percent), stat = "identity") + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  coord_flip() +
+  theme_minimal() +
+  guides(fill = FALSE) +
+  labs(x = "Type of Article", y = "Percent of Articles", title = "Articles about Climate and Disease Span Various Tags")
+
+```
+
+```{r date-plot}
+#create a bar chart showing when most of the climate and disease focused articles were published 
+df %>%
+  mutate(pubDay=gsub("T.*","",response.docs.pub_date)) %>%
+  group_by(pubDay) %>%
+  summarise(count=n()) %>%
+  filter(count >= 4) %>%
+  ggplot() +
+  geom_bar(aes(x=reorder(pubDay, count), y=count, fill=count), stat="identity") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  guides(fill = FALSE) +
+  coord_flip() +
+  theme_minimal() +
+  labs(x = "Date of Article", y = "Number of Articles", title = "There was a spike of climate/disease related articles on March 11th 2022")
+```
+
+The New York Times doesn't make full text of the articles available through the API. But we can use the first paragraph of each article.
+
+```{r tokenize}
+#names(df)
+paragraph <- names(df)[6] #The 6th column, "response.doc.lead_paragraph", is the one we want here. 
+
+#use tidytex::unnest_tokens to put in tidy form 
+tokenized <- df %>% unnest_tokens(word, paragraph) #word is the new column, paragraph is the source
+
+#inspect the list of tokens (words)
+#tokenized[,"word"] #tokenized$word also works
+```
+
+
+```{r}
+#remove contractions
+clean_tokens <- gsub("’s|’re|’ve|’m|’d|’ll", "", tokenized$word, fixed = FALSE)
+
+#check to make sure the above code worked
+unique(str_detect(clean_tokens, "here’s"))
+
+#remove digits
+clean_tokens <- str_remove_all(clean_tokens, "[:digit:]") #remove all numbers
+
+#remove comma
+clean_tokens <- str_remove_all(clean_tokens, ",") #remove all commas
+
+#change coronavirus to covid so they will be combined in counts
+clean_tokens <- str_replace_all(clean_tokens, "coronavirus", "covid")
+
+#remove days of the week
+weekdays <- c("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Remove weekdays from tokenized$word using a regular expression
+clean_tokens <- str_remove_all(clean_tokens, paste(weekdays, collapse = "|"))
+
+# Remove leading/trailing whitespace
+clean_tokens <- str_trim(clean_tokens)
+
+#add new column with cleaned tokenized words
+tokenized$clean <- clean_tokens
+```
+
+```{r stop-words}
+#remove stop words 
+data(stop_words)
+
+tokenized <- tokenized %>%
+  anti_join(stop_words, by = c("clean" = "word"))
+```
+
+```{r cleaning, eval=FALSE}
+#remove the empty strings
+tib <- subset(tokenized, clean!="")
+
+#reassign
+tokenized <- tib
+
+#try again
+tokenized %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 15) %>% 
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(n, clean, fill = n)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  guides(fill = FALSE) +
+  geom_col() +
+  labs(y = NULL) +
+  theme_bw() +
+  labs(x = "Number of mentions", title = "Most common words in the first paragraph of articles about climate and disease")
+```
+
+### transition to focusing on the article headlines 
+
+```{r}
+#names(df)
+paragraph <- names(df)[20] #The 6th column, "response.docs.headline.main", is the one we want here. 
+
+#use tidytex::unnest_tokens to put in tidy form 
+tokenized_headlines <- df %>% unnest_tokens(word, paragraph) #word is the new column, paragraph is the source
+
+#inspect the list of tokens (words)
+#tokenized_headlines[,"word"] 
+```
+
+
+```{r}
+#remove contractions
+clean_tokens_headlines <- gsub("’s|’re|’ve|’m|’d|’ll", "", tokenized_headlines$word, fixed = FALSE)
+
+#remove digits
+clean_tokens_headlines <- str_remove_all(clean_tokens_headlines, "[:digit:]") #remove all numbers
+
+#remove comma
+clean_tokens_headlines <- str_remove_all(clean_tokens_headlines, ",") #remove all commas
+
+#change coronavirus to covid so they will be combined in counts
+clean_tokens_headlines <- str_replace_all(clean_tokens_headlines, "coronavirus", "covid")
+
+#remove days of the week
+weekdays <- c("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Remove weekdays from tokenized$word using a regular expression
+clean_tokens_headlines <- str_remove_all(clean_tokens_headlines, paste(weekdays, collapse = "|"))
+
+# Remove leading/trailing whitespace
+clean_tokens_headlines <- str_trim(clean_tokens_headlines)
+
+#add new column with cleaned tokenized words
+tokenized_headlines$clean <- clean_tokens_headlines
+```
+
+
+```{r}
+#remove stop words 
+data(stop_words)
+
+tokenized_headlines <- tokenized_headlines %>%
+  anti_join(stop_words, by = c("clean" = "word"))
+```
+
+```{r}
+#remove the empty strings
+tib_headlines <- subset(tokenized_headlines, clean!="")
+
+#reassign
+tokenized_headlines <- tib_headlines
+
+#try again
+tokenized_headlines %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 10) %>% 
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(n, clean, fill = n)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  guides(fill = FALSE) +
+  geom_col() +
+  labs(y = NULL) +
+  theme_bw() +
+  labs(x = "Number of mentions", title = "Most common words in the headline of articles about climate and disease")
+```
+
+### comparing the graphs
+
+```{r}
+#saving the first chart for first paragraph of articles
+first_paragraph <- tokenized %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 15) %>% 
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(n, clean, fill = n)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  guides(fill = FALSE) +
+  geom_col() +
+  labs(y = NULL) +
+  theme_bw() +
+  labs(x = "Number of mentions", title = "First Paragraph Words")
+
+#saving the second chart for headlines of articles 
+headlines <- tokenized_headlines %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 10) %>% 
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(n, clean, fill = n)) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  guides(fill = FALSE) +
+  geom_col() +
+  labs(y = NULL) +
+  theme_bw() +
+  labs(x = "Number of mentions", title = "Headlines Words")
+
+library(patchwork) #to place plots side by side
+
+#plotting both side by side
+first_paragraph + headlines
+```
+
+The headlines words certainly appear more broad (e.g. briefing, evening, transcript, interviews) than the words included in the first paragraphs of these articles. Additionally, the headlines includes the name of a specific journalist, Ezra Klein. The words in the first paragraph cover similar themes, but are generally more descriptive than the headlines. In both, the words "climate", "health", "covid" and "biden" are particularly common. 
