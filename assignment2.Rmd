@@ -1,0 +1,288 @@
+---
+title: "Assignment 2"
+author: "Lewis White. Worked with Elke Windschitl to download data, but analyzed separately."
+date: "2023-04-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#load in packages ----
+library(LexisNexisTools)
+library(dplyr)
+library(readr)
+library(stringr)
+library(here)
+library(tidytext)
+library(tidyr) #pivot_wider()
+library(ggplot2)
+library(tidyverse)
+```
+
+### Assignment (Due 4/18 by 11:59 PM)
+
+1.  Access the Nexis Uni database through the UCSB library: <https://www.library.ucsb.edu/research/db/211>
+
+2.  Choose a key search term or terms to define a set of articles.
+
+**For this assignment, I chose articles based on the search "exotic animal trade"**
+
+3.  Use your search term along with appropriate filters to obtain and download a batch of at least 100 full text search results (.docx).
+
+-   Guidance for {LexisNexisTools} : <https://github.com/JBGruber/LexisNexisTools/wiki/Downloading-Files-From-Nexis>
+
+4.  Read your Nexis article document into RStudio.
+
+```{r, warning=FALSE, message=FALSE}
+#set working directory to where the data is located 
+setwd(here("data/animal_trade"))
+
+#obtain list of files 
+my_files <- list.files(pattern = ".docx", path = getwd(), full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+
+
+#read in the data
+dat <- lnt_read(my_files)
+```
+
+5.  This time use the full text of the articles for the analysis. First clean any artifacts of the data collection process (hint: this type of thing should be removed: "Apr 04, 2022( Biofuels Digest: <http://www.biofuelsdigest.com/> Delivered by Newstex"))
+
+```{r, warning=FALSE, message=FALSE}
+#get the meta data
+meta_df <- dat@meta # @ referencing table in list 
+
+#get the articles data
+articles_df <- dat@articles
+
+#get the paragraphs data
+paragraphs_df <- dat@paragraphs
+
+#create a new data frame with columns of interest
+exotic_animals_df <- tibble(Date = meta_df$Date,
+              Headline = meta_df$Headline,
+              id = dat@articles$ID,
+              text = dat@articles$Article)
+
+#finding similar articles 
+duplicates_df <- lnt_similarity(texts = dat@articles$Article,
+                                dates = dat@meta$Date,
+                                IDs = dat@articles$ID,
+                                threshold = 0.85)
+
+#removing similar articles 
+exotic_animals_df <- anti_join(exotic_animals_df, duplicates_df, by = c("id" = "ID_duplicate"))
+
+
+#manually remove a few other duplicates
+exotic_animals_df <- exotic_animals_df %>%
+  filter(!id %in% c(5, 6, 7, 18, 38, 40, 75))
+
+
+#looking through the text column, a lot of headline/artifact content shows up as really short paragraphs, so I'm removing anything under 50 characters. 
+exotic_animals_df$clean_text <- ifelse(nchar(exotic_animals_df$text) < 50, NA, exotic_animals_df$text) 
+
+#some articles start with irrelevent text and then --, so I'm removing content before -- punctuation.
+exotic_animals_df$clean_text <- gsub(".*?--", "", exotic_animals_df$text)
+
+#a few articles came from newstex and had a description of the article and newstex before actually beginning content, so I truncated the text here as well
+exotic_animals_df$clean_text <- gsub(".*Newstex", "", exotic_animals_df$clean_text)
+
+#making sure there aren't duplicates in the clean_text column 
+exotic_animals_df <- distinct(exotic_animals_df, clean_text, .keep_all = TRUE)
+
+# view the modified dataframe
+head(exotic_animals_df)
+```
+
+6.  Explore your data a bit and replicate the analyses above presented in class.
+
+```{r, warning=FALSE, message=FALSE}
+bing_sent <- get_sentiments('bing') #grab the bing sentiment lexicon from tidytext
+
+head(bing_sent, n = 5)
+
+# Split each article into individual words
+text_words <- exotic_animals_df %>%
+  # Use the unnest_tokens function from the tidytext package
+  unnest_tokens(output = word, input = clean_text, token = "words") 
+
+# Remove stop words and add sentiment scores
+sent_words <- text_words %>%
+  # Remove stop words using the anti_join function
+  anti_join(stop_words, by = 'word') %>%
+  # Add sentiment scores using the inner_join function
+  inner_join(bing_sent) %>%
+  # Convert sentiment to a numeric score (-1 for negative, 1 for positive)
+  mutate(sent_num = case_when(sentiment == "negative" ~ -1, sentiment == "positive" ~ 1))
+
+# Group the data by article and calculate the sentiment polarity
+sent_article <- sent_words %>%
+  # Group by Headline (article ID) and sentiment
+  group_by(Headline) %>%
+  # Count the number of words with each sentiment
+  count(id, sentiment) %>%
+  # Convert the data to wide format
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  # Calculate the polarity score
+  mutate(polarity = positive - negative)
+
+# Calculate the mean polarity score across all articles
+mean(sent_article$polarity)
+
+# Create a bar plot of the sentiment scores
+ggplot(sent_article, aes(x = id)) +
+  theme_classic() +
+  geom_col(aes(y = positive, fill = "Positive"), stat = "identity", alpha = 0.7) +
+  geom_col(aes(y = negative, fill = "Negative"), stat = "identity", alpha = 0.7) +
+  # Remove the y-axis label
+  theme(axis.title.y = element_blank()) +
+  labs(title = "Sentiment Analysis: Exotic Animal Trade",
+       y = "Sentiment Score", fill = "Sentiment") +
+  # Use a manual scale for the fill colors
+  scale_fill_manual(values = c("slateblue", "red3"), labels = c("Positive", "Negative"))
+
+
+```
+
+
+7.  Look at the nrc contribution to emotion by word plots. Identify and reclassify or remove at least one term that gives misleading results in your context.
+
+```{r, warning = FALSE}
+nrc_sent <- get_sentiments('nrc')
+
+nrc_word_counts <- text_words %>%
+  anti_join(stop_words) %>% #remove stop words
+  inner_join(nrc_sent) %>% #only keep words with nrc sentiment
+  count(word, sentiment, sort = T) %>% #count by word
+  ungroup()
+
+sent_counts <- text_words %>% 
+  anti_join(stop_words) %>% #remove stop words
+  group_by(id) %>% #group by the article id
+  inner_join(nrc_sent) %>% #only keep words with nrc sentiment
+  group_by(sentiment) %>% #group by the sentiment
+  count(word, sentiment, sort = T) #count word, sentiment and sort in order
+
+#plot top words for each sentiment
+sent_counts %>%
+  group_by(sentiment) %>% #group by sentiment 
+  slice_max(n, n = 10) %>% #top 10 words for each sentiment
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL,
+       title = "Most common words for each sentiment category") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8))
+
+#change exotic to negative 
+sent_counts$sentiment <- ifelse(sent_counts$word == "exotic" & sent_counts$sentiment == "positive", "negative", sent_counts$sentiment)
+
+#I'm quite fond of snakes, so I'm going to change this word to positive :)
+sent_counts$sentiment <- ifelse(sent_counts$word == "snake" & sent_counts$sentiment == "negative", "positive", sent_counts$sentiment)
+
+#While the government gives many reasons to be fearful, I'm going to be bold/optimistic and change it to trust
+sent_counts$sentiment <- ifelse(sent_counts$word == "government" & sent_counts$sentiment == "fear", "trust", sent_counts$sentiment)
+
+#change trade to negative
+sent_counts$sentiment <- ifelse(sent_counts$word == "trade" & sent_counts$sentiment == "trust", "negative", sent_counts$sentiment)
+
+
+
+#recreate the previous plot with the new word categories
+sent_counts %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL,
+       title = "Most common words for each sentiment category") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, size = 8))
+
+```
+
+8.  Plot the amount of nrc emotion words as a percentage of all the emotion words used each day (aggregate text from articles published on the same day). How does the distribution of emotion words change over time? Can you think of any reason this would be the case?
+
+```{r, warning = FALSE}
+#new df with just date and words
+date_text_words <- text_words %>%
+  select(Date, word)
+
+#clean df
+date_nrc_word_counts <- date_text_words %>%
+  anti_join(stop_words) %>%
+  inner_join(nrc_sent) %>%
+  count(Date, word, sentiment, sort = T) %>%
+  ungroup() %>%
+  filter(!is.na(Date)) #remove rows without a date
+
+
+#change exotic to negative 
+date_nrc_word_counts$sentiment <- ifelse(date_nrc_word_counts$word == "exotic" & date_nrc_word_counts$sentiment == "positive", "negative", date_nrc_word_counts$sentiment)
+
+#I'm quite fond of snakes, so I'm going to change this word to positive :)
+date_nrc_word_counts$sentiment <- ifelse(date_nrc_word_counts$word == "snake" & date_nrc_word_counts$sentiment == "negative", "positive", date_nrc_word_counts$sentiment)
+
+#While the government gives many reasons to be fearful, I'm going to be bold/optimistic and change it to trust
+date_nrc_word_counts$sentiment <- ifelse(date_nrc_word_counts$word == "government" & date_nrc_word_counts$sentiment == "fear", "trust", date_nrc_word_counts$sentiment)
+
+#change trade to negative
+date_nrc_word_counts$sentiment <- ifelse(date_nrc_word_counts$word == "trade" & date_nrc_word_counts$sentiment == "trust", "negative", date_nrc_word_counts$sentiment)
+
+
+
+
+#calculate the amount of nrc emotion words as a percentage of all the emotion words used each day
+date_percent_emotion <- date_nrc_word_counts %>%
+  group_by(Date, sentiment) %>%
+  count() %>%
+  ungroup() %>%
+  group_by(Date) %>%
+  mutate(total_n = sum(n)) %>%
+  mutate(percent_sent = n/total_n) %>%
+  print(n = 20)
+```
+
+```{r}
+#plot over time
+ggplot(date_percent_emotion, aes(x = Date, y = percent_sent)) +
+  geom_point(alpha = 0.5) +
+  theme_bw() +
+  facet_wrap(~sentiment) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Date",
+       y = "Percent of all Sentiment Words",
+       title = "There do not appear to be clear trends in the sentiment of words \n related to exotic animal trade")
+
+#there are just a few articles before 2015, so to try and determine a trend for recent years, I created another plot for just years after 2015. 
+date_percent_emotion %>%
+  filter(Date > "2015-01-01") %>%
+  ggplot(aes(x = Date, y = percent_sent)) +
+  geom_point(alpha = 0.5) +
+  theme_bw() +
+  facet_wrap(~sentiment) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Date",
+       y = "Percent of all Sentiment Words",
+       title = "There still do not appear to be clear trends in the sentiment of words \n related to exotic animal trade")
+
+
+  
+```
+
+**For my articles, the distribution of emotion words does not appear to change much over time. It looks like negative words, like anger, fear, and negative itself are trending upwards as a percentage of the total emotion words. It seems like articles written about exotic animal trade are becoming increasingly frustrated by the practice. It's also possible that the way people write about issues like this is changing; for example, in order to try and get more readers (or enact change), authors of articles may be using more emotional language. Interestingly, words tagged as "sadness" remained relatively stable over time.** 
+
+**With negative words become more common as a percent of total emotional words, it follows that words with positive associations (e.g. joy, trust, and positive) would decrease correspondingly, and that is evident here.** 
+
+**Also, I was initially surprised by the high percentage of positive words throughout the articles, but looking at the top 10 positive words, most are related to the government and police, which explains why the words are positive and appearing frequently in articles about exotic animal trade.** 
+
+
+

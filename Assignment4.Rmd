@@ -1,0 +1,395 @@
+---
+title: "Assignment 4"
+author: "Lewis White"
+date: "2023-05-02"
+output: html_document
+---
+
+Lab 4 Assignment: Due May 9 at 11:59pm
+
+
+### 1. Select another classification algorithm
+
+**I'm selecting gradient boosting**
+
+Setting up the packages, data, recipe, etc.
+
+```{r packages, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# LOADING PACKAGES
+library(tidytext)
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(tidyverse) #cleaning data, ggplot, etc 
+library(here) #for setting working directory
+library(tidymodels) #for modeling/statistical analysis
+library(rsample) #for splitting data into train / test
+library(recipes) #for creating the recipe for ML
+library(tictoc) #timing functions/loops
+library(xgboost) #gradient boosting 
+library(vip) #for determining variable importance
+library(pROC) #unused
+library(parsnip) 
+```
+
+This data set includes more possible predictors than the text alone, but for this model we will only use the text variable
+```{r data, warning = FALSE, message = FALSE}
+urlfile ="https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/climbing_reports_model_dat.csv"
+
+incidents_df<-readr::read_csv(url(urlfile))
+```
+
+Now we'll split our data into training and test portions
+
+```{r split-data, warning = FALSE, message = FALSE}
+set.seed(1234) #set seed for reproducibility 
+
+incidents2class <- incidents_df %>%
+  mutate(fatal = factor(if_else(
+    is.na(Deadly) ,
+    "non-fatal", "fatal"))) #NA is non-fatal, else is fatal
+
+#create test and train data
+incidents_split <- initial_split(incidents2class, strata = fatal)
+incidents_train <- training(incidents_split)
+incidents_test <- testing(incidents_split)
+```
+
+We use recipe() to specify the predictor and outcome variables and the data.
+
+```{r recipe, warning = FALSE, message = FALSE}
+#create recipe
+incidents_rec <- recipe(fatal ~ Text, data = incidents_train)
+```
+
+Next we add some familiar pre-processing steps on our Text variable: tokenize to word level, filter to the most common words, and calculate tf-idf.
+
+```{r pre-process, warning = FALSE, message = FALSE}
+#tokenize text
+recipe <- incidents_rec %>%
+  step_tokenize(Text) %>%
+  step_tokenfilter(Text, max_tokens = 1000) %>%
+  step_tfidf(Text) #new one from textrecipes
+```
+
+```{r workflow, warning = FALSE, message = FALSE}
+#create base workflow with recipe
+incidents_wf <- workflow() %>%
+  add_recipe(recipe)
+```
+
+### 2. Conduct an initial out-of-the-box model fit on the training data and prediction on the test test data.  Assess the performance of this initial model.
+
+```{r, warning = FALSE, message=FALSE}
+#model with default parameters
+incident_out_of_box_spec <- parsnip::boost_tree(mode = "classification",
+                                               engine = "xgboost")
+
+
+set.seed(234)
+#create folds for cross validation
+incidents_folds <- vfold_cv(incidents_train, strata = fatal) #default is v = 10 stratifying due to class imbalance 
+incidents_folds
+
+#create workflow for out of box model
+xgb_defaults_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(incident_out_of_box_spec)
+
+#fit the model
+xgb_defaults_rs <- fit_resamples(
+  xgb_defaults_wf,
+  incidents_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+
+
+#collect metrics on the model result
+xgb_defaults_rs_metrics <- collect_metrics(xgb_defaults_rs)
+xgb_defaults_rs_predictions <- collect_predictions(xgb_defaults_rs)
+xgb_defaults_rs_metrics
+
+
+#ROC AUC graph 
+xgb_defaults_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = fatal, .pred_fatal) %>%
+  autoplot() +
+  labs(
+    "Resamples",
+    title = "ROC curve for Climbing Incident Reports"
+  )
+
+
+#confusion matrix
+conf_mat_resampled(xgb_defaults_rs, tidy = FALSE) %>% #compute matrix for each fold then average
+  autoplot(type = "heatmap")
+```
+
+```{r, warning = FALSE, message = FALSE}
+#Fit on the training data
+fitted_xgb <- fit(xgb_defaults_wf, incidents_train) 
+
+
+#Fit on the test data
+last_fit(xgb_defaults_wf, incidents_split) %>%
+  collect_metrics()
+
+#check to see how many fatal vs non-fatal incident reports there are to determine accuracy of dummy classifier
+incidents_test %>%
+  group_by(fatal) %>%
+  count()
+```
+
+**The gradient boosted model with default parameter performed well. A dummy model that only predicts the dominant class would result in an accuracy of 0.7965 (552/693). This boosted model performed quite a bit better than this, with an accuracy of 0.912.** 
+
+### 3. Select the relevant hyperparameters for your algorithm and tune your model.
+
+Start by tuning the learning rate 
+
+```{r, warning = FALSE, message = FALSE}
+#model specification just tuning the learning rate
+incident_spec_lr_tune <- boost_tree(trees = 1000, #starting with large number of trees
+                               learn_rate = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+#create a workflow
+incident_lr_tune_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(incident_spec_lr_tune)
+
+
+#creating a gird of learning rate values to tune so we can find optimal value
+learn_rate_grid <- expand.grid(learn_rate = seq(0.0001, 0.3, length.out = 15))
+
+tic() #start timer
+
+set.seed(123)
+
+#tuning the learn rate
+boost_rs <- tune_grid(
+  incident_lr_tune_wf,
+  resamples = incidents_folds, #resamples to use
+  grid = learn_rate_grid, #grid to try
+  metrics = metric_set(accuracy, roc_auc, pr_auc) #how to assess which combinations are best 
+)
+
+toc() #end timer
+
+#showing the best options for the learn_rate value
+show_best(boost_rs, metric = "accuracy")
+```
+
+Create a new specification where the learning rate is set and tune the tree parameters.
+
+```{r, warning = FALSE, message = FALSE}
+# XGBoost model specification
+incident_tree_param_spec <- 
+  parsnip::boost_tree(
+    mode = "classification",
+    trees = 100,
+    min_n = tune(),
+    tree_depth = tune(),
+    loss_reduction = tune(),
+    learn_rate = select_best(boost_rs, metric = "roc_auc")$learn_rate) %>%
+    set_engine("xgboost")
+
+
+# grid specification
+xgboost_tree_params <- 
+  dials::parameters(
+    min_n(),
+    tree_depth(),
+    loss_reduction())
+
+
+#grid_max_entropy:  construct parameter grids that try to cover the parameter space such that any portion of the space has an observed combination that is not too far from it.
+xgboost_tree_params_grid <- 
+  dials::grid_max_entropy( 
+    xgboost_tree_params,  
+    size = 15 #number of different parameter combinations 
+  )
+
+#tree params workflow
+xgboost_tree_params_wf <- 
+  workflows::workflow() %>%
+  add_model(incident_tree_param_spec) %>% 
+  add_recipe(recipe)
+
+tic()
+
+set.seed(123)
+
+# hyperparameter tuning
+xgboost_tree_params_tuned <- tune::tune_grid(
+  object = xgboost_tree_params_wf,
+  resamples = incidents_folds,
+  grid = xgboost_tree_params_grid,
+  metrics = yardstick::metric_set(accuracy, roc_auc, pr_auc),
+  #control = tune::control_grid(verbose = TRUE)
+)
+
+toc()
+
+#show the performance of the best models based on the roc area under the curve metric 
+show_best(xgboost_tree_params_tuned, metric = "accuracy")
+```
+
+
+
+Create a new specification where you set the learning rate and tree parameters (which you already optimized) and tune the stochastic parameters.
+
+```{r, warning = FALSE, message = FALSE}
+#goal: tune stochastic parameters mtry and sample size 
+
+# XGBoost model specification
+incident_stochastic_spec <- 
+  parsnip::boost_tree(
+    mode = "classification",
+    trees = 1000, #number of trees contained in the ensemble
+    min_n = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$min_n, #minimum number of data points in a node that is required for node to be split further
+    tree_depth = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$tree_depth, #maximum depth of tree (i.e. number of splits)
+    learn_rate = select_best(boost_rs, metric = "roc_auc")$learn_rate, #the rate at which the bosting algorithm adapts from iteration-to-iteration
+    loss_reduction = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$loss_reduction, #the reduction in the loss function required to split further
+    mtry = tune(), #number predictors randomly sampled at each split
+    sample_size = tune(), #the amount of data exposed to the fitting routine
+    stop_iter = tune()) %>% #the number of iterations without improvement before stopping 
+    set_engine("xgboost")
+
+
+#SET UP TUNING GRID
+
+# grid specification
+xgboost_stochastic_params <- 
+  dials::parameters(finalize(mtry(), select(incidents_train, Text)), #mtry values will range from 1 to the number of predictors included in the model
+                    sample_size = sample_prop(c(.4, .9)), #sample between 40% and 90% of observations 
+                    stop_iter()) #The number of iterations without improvement before stopping
+
+xgboost_stochastic_grid <- 
+  dials::grid_max_entropy(
+    xgboost_stochastic_params, 
+    size = 25
+  )
+
+#create workflow
+xgboost_stochastic_wf <- incidents_wf %>%
+  add_model(incident_stochastic_spec)
+
+tic()
+
+set.seed(123)
+
+# hyperparameter tuning
+xgboost_stochastic_tuned <- tune::tune_grid(
+  object = xgboost_stochastic_wf,
+  resamples = incidents_folds,
+  grid = xgboost_stochastic_grid,
+  metrics = yardstick::metric_set(accuracy, roc_auc, pr_auc),
+  #control = tune::control_grid(verbose = TRUE)
+)
+
+toc()
+
+show_best(xgboost_stochastic_tuned, metric = "accuracy") #not sure why accuracy went down in this step
+```
+
+
+
+### 4. Conduct a model fit using your newly tuned model specification.  What are the terms most highly associated with non-fatal reports?  What about fatal reports? 
+
+```{r, warning = FALSE, message = FALSE}
+#create the final model using all of the optimal tuned parameter values
+
+full_model_spec <- 
+  parsnip::boost_tree(
+    mode = "classification",
+    trees = 1000, #number of trees contained in the ensemble
+    min_n = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$min_n, #minimum number of data points in a node that is required for node to be split further
+    tree_depth = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$tree_depth, #maximum depth of tree (i.e. number of splits)
+    learn_rate = select_best(boost_rs, metric = "roc_auc")$learn_rate, #the rate at which the bosting algorithm adapts from iteration-to-iteration
+    mtry = select_best(xgboost_stochastic_tuned, metric = "roc_auc")$mtry, #number predictors randomly sampled at each split
+    loss_reduction = select_best(xgboost_tree_params_tuned, metric = "roc_auc")$loss_reduction, #the reduction in the loss function required to split further
+    sample_size = select_best(xgboost_stochastic_tuned, metric = "roc_auc")$sample_size, #the amount of data exposed to the fitting routine
+    stop_iter = select_best(xgboost_stochastic_tuned, metric = "roc_auc")$stop_iter) %>% #the number of iterations without improvement before stopping 
+    set_engine("xgboost")
+```
+
+Variable importance 
+
+```{r, message=FALSE, warning=FALSE}
+
+#VIP
+#bake the new data because vip isn't working for workflows
+baked_incident_train <- recipe %>%
+  prep(incidents_train) %>%
+  bake(incidents_train) 
+  
+
+set.seed(123)
+full_model_spec %>%
+  fit(fatal ~ ., data = baked_incident_train) %>%
+  vip(geom = "col", #column chart
+      num_features = 10, 
+      mapping = aes_string(fill = "Importance")) + #color determined by importance 
+  theme_minimal() +
+  labs(title = "Chart of Variable Importance")
+
+
+
+
+#ATTEMPT AT CODE FROM CLASS ~ THIS DID NOT WORK
+
+#final workflow
+# final_wf <- incidents_wf %>%
+#   add_model(full_model_spec)
+
+# fitted_boost <- fit(final_wf, incidents_train)
+# 
+# fitted_boost %>%
+#   extract_fit_parsnip() %>% 
+#   tidy() %>%
+#   arrange(-estimate)
+```
+
+**I wasn't able to figure out how to show which terms are highly associated with fatal / non-fatal reports. I was, however, able to create a variable importance chart. In the chart, I think it's fair to assume that the words "died", "body", "death", and "fatal" are associated with fatal reports. I can also surmise that "hospital" and "injury" are associated with non-fatal reports.**
+
+
+### 5. Predict fatality of the reports in the test set.  Compare this prediction performance to that of the Naive Bayes and Lasso models. 
+
+
+```{r, warning = FALSE, message = FALSE}
+#final workflow
+final_wf <- incidents_wf %>%
+  add_model(full_model_spec)
+
+set.seed(123)
+#pop my spec into a workflow for final fit 
+final_fit <- last_fit(final_wf, incidents_split)
+
+final_fit %>% collect_metrics()
+
+test_incident_preds <- final_fit$.predictions[[1]]
+
+#create confusion matrix 
+conf_matrix <- test_incident_preds %>% yardstick::conf_mat(truth=fatal, estimate=.pred_class) 
+
+autoplot(conf_matrix, type = "heatmap") + 
+  labs(title = "Confusion Matrix for Test Data")
+```
+
+
+**The predictive performance of my final extreme gradient boosted model is pretty good, with an accuracy of 0.876 and ROC area under the curve value of 0.941. The confusion matrix shows that most errors occured by the model mistakenly labeling fatal reports as non-fatal, which makes sense due to the class imbalance.**
+
+**The model performed better than Naive Bayes, which had an accuracy of 0.8 and ROC AUC of 0.736. The lasso logistic regression model, however, outperformed my xg boosted model. With an accuracy of 0.916 and ROC AUC of 0.951, the lasso regression had the best performance of the models run on this data.** 
+
+
+
+
+
+
+
+
+
