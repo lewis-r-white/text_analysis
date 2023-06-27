@@ -13,10 +13,8 @@ This repository contains lecture materials, reading references, and assignments 
 |      | 4/12       | Sentiment Analysis I Lab                 |                                 | Lab 2           |
 | 3    | 4/17       | Topic Analysis Lecture                   | TMR 6.0-6.4                     |                 |
 |      | 4/19       | Topic Analysis Lab                       |                                 | Lab 3           |
-| 4    | Break      |                                        |                                 |                 |
-|      | Break      |                                        |                                 |                 |
-| 5    | 5/01       | Classification Lecture                   | SMLTR 7.1-7.4                   |                 |
+| 4    | 5/01       | Classification Lecture                   | SMLTR 7.1-7.4                   |                 |
 |      | 5/03       | Classification Lab                       |                                 | Lab 4 (updated) |
-| 6    | 5/08       | Word Embeddings Lecture                  | SMLTR 5.1-5.7                   |                 |
+| 5    | 5/08       | Word Embeddings Lecture                  | SMLTR 5.1-5.7                   |                 |
 |      | 5/10       | Word Embeddings Lab                       |                                 | Lab 5           |
 
