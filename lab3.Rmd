@@ -1,0 +1,487 @@
+---
+title: 'Lab 3: Topic Analysis'
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r packages}
+# Load packages ----
+
+library(quanteda) 
+library(tm)
+library(topicmodels)
+library(ldatuning)
+library(tidyverse)
+library(tidytext)
+library(reshape2)
+
+library(LexisNexisTools)
+library(readr)
+library(stringr)
+library(here)
+```
+
+Load the data
+
+```{r data}
+tbl <-read_csv("https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/sb_dat_text.csv")
+```
+
+First we'll build the corpus using corpus() from {quanteda}.
+
+```{r corpus}
+corp_sb <- corpus(x = tbl, text_field = "text")
+
+stories_stats <- summary(corp_sb)
+
+head(stories_stats)
+```
+
+Next, we can use tokens(), also from {quanteda}, to construct a tokens object. tokens() takes a range of arguments related to cleaning the data. Next we'll create a stopwords lexicon and remove each word contained in it from our tokens object. The quanteda function tokens_select() lets us do the removal.
+
+```{r tokens}
+toks <- tokens(corp_sb, remove_punct = T, remove_numbers = T)
+
+add_stops <- c(stopwords("en"), "spring", "break")
+
+toks1 <- tokens_select(toks, pattern = add_stops, selection = "remove")
+```
+
+Now we can transform our data to prepare for topic modeling. Let's create a document-feature matrix with quanteda::dfm(). Topic modeling doesn't work with empty rows in this matrix, so we'll need to remove those. I do that here using {slam}, which is designed to deal with sparse matrices like ours.
+
+```{r dfm}
+dfm_sb <- dfm(toks1, tolower = T)
+dfm <- dfm_trim(dfm_sb, min_docfreq = 2) #trim to matrix ~ only want words that occur in at least 2 documents
+
+head(dfm)
+
+
+sel_idx <- slam::row_sums(dfm) > 0
+
+dfm <- dfm[sel_idx,]
+
+```
+
+Great, now we are almost ready to run a model. We just have to come up with an initial value for k, the number of latent topics present in the data. How do we do this? There are multiple methods. I think there are three main ideas you (well, ChatGPT) wrote about in your stories: weather, travel, and relaxation. So I will tell the model to look for 3 topics by setting the k parameter = 3.
+
+```{r LDA_modeling}
+k <- 3
+
+topicModel_k3 <- LDA(dfm, 
+                     k, 
+                     method = "Gibbs", #Gibbs for estimated join distribution
+                     control = list(iter = 500, 
+                             verbose = 100)) 
+
+```
+
+Running topicmodels::LDA() produces two posterior probability distributions: theta, a distribution over k topics within each document and beta,the distribution v terms within each topic, where v is our vocabulary (total unique words in our data set).
+
+Let's examine at our results. posterior() extracts theta and beta
+
+```{r LDA_modeling}
+result <- posterior(topicModel_k3) #Bayesian approach
+
+attributes(result) #terms and topics 
+
+beta <- result$terms
+theta <- result$topics
+
+dim(beta)
+dim(theta)
+
+terms(topicModel_k3, 15)
+```
+
+Alright, so that worked out OK. An alternative to specifying k based on theory or a hypothesis is to run a series of models using a range of k values. ldatuning::FindTopicsNumber gives us the tools for this.
+
+```{r find_k}
+result <- FindTopicsNumber(dfm,
+                           topics = seq(from = 2, to = 20, by = 1),
+                           method = "Gibbs",
+                           metrics = c("CaoJuan2009", "Deveaud2014"),
+                           verbose = T)
+
+result
+
+FindTopicsNumber_plot(result)
+```
+
+Alright, now let's estimate another model, this time with our new value of k.
+
+```{r LDA_again}
+k <- 10
+
+topicModel_k10 <- LDA(dfm, k, method="Gibbs", control=list(iter = 500, verbose = 25)) #with the iterations it could keep going for longer and only does the last one. wIll automatically stop if it stops improving. You could specify large iteration number but if it doesn't improve likelihood, it will find optimal number. 
+
+tmResult <- posterior(topicModel_k10)
+terms(topicModel_k10, 10)
+
+theta <- tmResult$topics
+beta <- tmResult$terms
+
+vocab <- (colnames(beta))
+```
+
+There are multiple proposed methods for how to measure the best k value. You can [go down the rabbit hole here](https://rpubs.com/siri/ldatuning)
+
+```{r top_terms_topic}
+sb_topics <- tidy(topicModel_k10, matrix = "beta") 
+
+top_terms <- sb_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+```
+
+```{r plot_top_terms}
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic, sep = "")) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_x_reordered()+
+  coord_flip()
+
+```
+
+Let's assign names to the topics so we know what we are working with. We can name the topics by interpreting the overall theme or idea they represent, but for now let's just name them by their top terms.
+
+```{r topic_names}
+topics_words <- terms(topicModel_k10, 5)
+
+topic_names <- apply(topics_words, 2, paste, collapse = " ")
+```
+
+We can explore the theta matrix, which contains the distribution of each topic over each document.
+
+```{r topic_dists}
+example_ids <- c(1:5)
+
+n <- length(example_ids)
+
+# get topic proportions from example documents 
+example_props <- theta[example_ids,]
+
+colnames(example_props) <- topic_names
+
+
+viz_df <- melt(cbind(data.frame(example_props),
+                     document = factor(1:n),
+                     variable.name = "topic",
+                     id.vars = "document"))
+
+
+
+# get topic proportions from example documents
+ 
+ggplot(data = viz_df, aes(variable, value, fill = document), ylab = "proportion") +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  
+  coord_flip() +
+  facet_wrap(~ document, ncol = 5)
+```
+
+Here's a neat JSON-based model visualizer, {LDAviz}.  We can use this to visualize the words-on-topics distribution and intertopic distances.  The size of the circles in the LDAvis plot show proportionally the amount of words that belong to each topic, and the space between circles shows the degree to which the circles share words.
+
+```{r LDAvis}
+library(LDAvis) #visualization 
+library("tsne") #matrix decomposition
+svd_tsne <- function(x) tsne(svd(x)$u)
+json <- createJSON(
+  phi = tmResult$terms, 
+  theta = tmResult$topics, 
+  doc.length = rowSums(dfm), 
+  vocab = colnames(dfm), 
+  term.frequency = colSums(dfm),
+  mds.method = svd_tsne,
+  plot.opts = list(xlab="", ylab="")
+)
+serVis(json)
+
+```
+The relevance param. defines the relationship between the word's topic probability and its lift. Lift is the ratio of the probability of the word in the topic to the probability of the word in the corpus. The more frequent is the word in the corpus, the lower will be its lift. Saliency also gives a idea of both how common the word is in a topic to overall how common it is.  Same vein as tf-idf
+
+### Assignment Lab 3:
+
+Due in 2 weeks: May 2 at 11:59PM
+
+For this assignment you'll the articles data you downloaded from Nexis Uni in Week 2.
+
+1.  Create a corpus from your articles.
+
+```{r}
+#set working directory to where the data is located 
+setwd(here("data/animal_trade"))
+
+#obtain list of files 
+my_files <- list.files(pattern = ".docx", path = getwd(), full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+
+
+#read in the data
+dat <- lnt_read(my_files)
+
+
+#get the meta data
+meta_df <- dat@meta # @ referencing table in list 
+
+#get the articles data
+articles_df <- dat@articles
+
+#get the paragraphs data
+paragraphs_df <- dat@paragraphs
+
+#create a new data frame with columns of interest
+exotic_animals_df <- tibble(Date = meta_df$Date,
+              Headline = meta_df$Headline,
+              id = dat@articles$ID,
+              text = dat@articles$Article)
+
+#finding similar articles 
+duplicates_df <- lnt_similarity(texts = dat@articles$Article,
+                                dates = dat@meta$Date,
+                                IDs = dat@articles$ID,
+                                threshold = 0.85)
+
+#removing similar articles 
+exotic_animals_df <- anti_join(exotic_animals_df, duplicates_df, by = c("id" = "ID_duplicate"))
+
+
+#manually remove a few other duplicates
+exotic_animals_df <- exotic_animals_df %>%
+  filter(!id %in% c(5, 6, 7, 18, 38, 40, 75))
+
+
+#looking through the text column, a lot of headline/artifact content shows up as really short paragraphs, so I'm removing anything under 50 characters. 
+exotic_animals_df$clean_text <- ifelse(nchar(exotic_animals_df$text) < 50, NA, exotic_animals_df$text) 
+
+#some articles start with irrelevent text and then --, so I'm removing content before -- punctuation.
+exotic_animals_df$clean_text <- gsub(".*?--", "", exotic_animals_df$text)
+
+#a few articles came from newstex and had a description of the article and newstex before actually beginning content, so I truncated the text here as well
+exotic_animals_df$clean_text <- gsub(".*Newstex", "", exotic_animals_df$clean_text)
+
+#making sure there aren't duplicates in the clean_text column 
+exotic_animals_df <- distinct(exotic_animals_df, clean_text, .keep_all = TRUE)
+```
+
+
+```{r}
+#eat stands for exotic animal trade
+corp_eat <- corpus(x = exotic_animals_df, text_field = "clean_text")
+
+news_stats <- summary(corp_eat)
+
+head(news_stats)
+```
+
+
+2.  Clean the data as appropriate.
+
+```{r}
+toks <- tokens(corp_eat, remove_punct = T, remove_numbers = T)
+
+add_stops <- c(stopwords("en"), "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "exotic", "animal", "trade", "animals")
+
+toks_eat <- tokens_select(toks, pattern = add_stops, selection = "remove")
+
+toks_eat
+```
+
+```{r}
+dfm_eat <- dfm(toks_eat, tolower = T)
+
+dfm <- dfm_trim(dfm_eat, min_docfreq = 5) #trim to matrix ~ only want words that occur in at least 5 documents
+
+head(dfm)
+
+
+sel_idx <- slam::row_sums(dfm) > 0
+
+dfm_sparse <- dfm[sel_idx,]
+```
+
+
+3.  Run three models (i.e. with 3 values of k) and select the overall best value for k (the number of topics) - include some justification for your selection: theory, FindTopicsNumber() optimization metrics, interpretability, LDAvis. Select the best value of K and move forward with that model. 
+
+```{r}
+set.seed(1234)
+picking_k <- FindTopicsNumber(dfm_sparse,
+                           topics = seq(from = 2, to = 25, by = 1),
+                           method = "Gibbs",
+                           metrics = c("CaoJuan2009", "Deveaud2014"),
+                           verbose = T)
+
+picking_k
+
+FindTopicsNumber_plot(picking_k) #k = 5, 9, 12
+
+
+
+k = 5
+
+topicModel_k5 <- LDA(dfm, 
+                     k, 
+                     method = "Gibbs", #Gibbs for estimated join distribution
+                     control = list(iter = 500,
+                                    verbose = 100)) 
+
+result_k5 <- posterior(topicModel_k5) #Bayesian approach
+
+attributes(result_k5) #terms and topics 
+
+beta_k5 <- result_k5$terms
+theta_k5 <- result_k5$topics
+
+dim(beta_k5)
+dim(theta_k5)
+
+terms(topicModel_k5, 10)
+
+
+
+
+
+k = 9
+
+topicModel_k9 <- LDA(dfm, 
+                     k, 
+                     method = "Gibbs", #Gibbs for estimated join distribution
+                     control = list(iter = 500,
+                                    verbose = 100)) 
+
+result_k9 <- posterior(topicModel_k9) #Bayesian approach
+
+attributes(result_k9) #terms and topics 
+
+beta_k9 <- result_k9$terms
+theta_k9 <- result_k9$topics
+
+dim(beta_k9)
+dim(theta_k9)
+
+terms(topicModel_k9, 10)
+
+
+k = 12
+
+topicModel_k12 <- LDA(dfm, 
+                     k, 
+                     method = "Gibbs", #Gibbs for estimated join distribution
+                     control = list(iter = 500,
+                                    verbose = 100)) 
+
+result_k12 <- posterior(topicModel_k12) #Bayesian approach
+
+attributes(result_k12) #terms and topics 
+
+beta_k12 <- result_k12$terms
+theta_k12 <- result_k12$topics
+
+dim(beta_k12)
+dim(theta_k12)
+
+terms(topicModel_k12, 10)
+
+#I think 12 worked the best ~ there are some coherent categories. 
+
+```
+
+
+4. Plot the top terms in each topic and the distribution of topics across a sample of the documents (constrained by what looks good in the plot).
+
+```{r top_terms_topic}
+eat_topics <- tidy(topicModel_k12, matrix = "beta") 
+
+top_terms <- eat_topics %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms
+```
+
+```{r plot_top_terms}
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic, sep = "")) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_x_reordered()+
+  coord_flip()
+
+```
+
+
+
+```{r}
+tmResult <- posterior(topicModel_k12)
+
+
+theta <- tmResult$topics
+beta <- tmResult$terms
+
+vocab <- (colnames(beta))
+```
+
+
+```{r topic_names}
+topics_words <- terms(topicModel_k12, 5)
+
+topic_names <- apply(topics_words, 2, paste, collapse = " ")
+```
+
+```{r topic_dists}
+example_ids <- c(1:10)
+
+n <- length(example_ids)
+
+# get topic proportions from example documents 
+example_props <- theta[example_ids,]
+
+colnames(example_props) <- topic_names
+
+
+viz_df <- melt(cbind(data.frame(example_props),
+                     document = factor(1:n),
+                     variable.name = "topic",
+                     id.vars = "document"))
+
+
+
+# get topic proportions from example documents
+ 
+ggplot(data = viz_df, aes(variable, value, fill = document), ylab = "proportion") +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  
+  coord_flip() +
+  facet_wrap(~ document, ncol = 5)
+```
+
+
+```{r}
+library(LDAvis) #visualization 
+library("tsne") #matrix decomposition
+svd_tsne <- function(x) tsne(svd(x)$u)
+json <- createJSON(
+  phi = tmResult$terms, 
+  theta = tmResult$topics, 
+  doc.length = rowSums(dfm), 
+  vocab = colnames(dfm), 
+  term.frequency = colSums(dfm),
+  mds.method = svd_tsne,
+  plot.opts = list(xlab="", ylab="")
+)
+serVis(json)
+```
+
+
+5.  Take a stab at interpreting the resulting topics. What are the key themes discussed in the articles in your data base?
+
+**Themes: Articles about Tiger King, Covid / disease, govt/law, videos/meedia , conservation/environemnt, **
